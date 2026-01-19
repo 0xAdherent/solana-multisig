@@ -1,0 +1,505 @@
+/*
+import * as anchor from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import { Multisig } from "../target/types/multisig";
+
+describe("multisig", () => {
+  // Configure the client to use the local cluster.
+  anchor.setProvider(anchor.AnchorProvider.env());
+
+  const program = anchor.workspace.multisig as Program<Multisig>;
+
+  it("Is initialized!", async () => {
+    // Add your test here.
+    const tx = await program.methods.initialize().rpc();
+    console.log("Your transaction signature", tx);
+  });
+});
+*/
+
+/*
+import * as anchor from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import { Multisig } from "../target/types/multisig";
+import { PublicKey, SystemProgram, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { assert } from "chai";
+
+describe("Multisig", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+  const program = anchor.workspace.multisig as Program<Multisig>;
+
+  // 创建 3 个成员钱包（模拟多签成员）
+  const member1 = anchor.web3.Keypair.generate();
+  const member2 = anchor.web3.Keypair.generate();
+  const member3 = anchor.web3.Keypair.generate();
+
+  let multisigPDA: PublicKey;
+  let multisigBump: number;
+
+  // 接收方（转账目标）
+  const recipient = anchor.web3.Keypair.generate();
+
+  before(async () => {
+    // 给成员和接收方空投 SOL
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(member1.publicKey, LAMPORTS_PER_SOL),
+      "confirmed"
+    );
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(member2.publicKey, LAMPORTS_PER_SOL),
+      "confirmed"
+    );
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(recipient.publicKey, LAMPORTS_PER_SOL),
+      "confirmed"
+    );
+
+    // 计算 Multisig PDA
+    const members = [member1.publicKey, member2.publicKey, member3.publicKey].sort((a, b) =>
+      a.toBuffer().compare(b.toBuffer())
+    ); // 必须排序！seeds 需确定性
+
+    [multisigPDA, multisigBump] = PublicKey.findProgramAddressSync(
+      [Buffer.from("multisig"), ...members.map(m => m.toBuffer())],
+      program.programId
+    );
+
+    console.log("Creating multisig with members:", members.map(m => m.toBase58()));
+  });
+
+  it("Creates a multisig", async () => {
+    const members = [member1.publicKey, member2.publicKey, member3.publicKey].sort((a, b) =>
+      a.toBuffer().compare(b.toBuffer())
+    );
+
+    await program.methods
+      .createMultisig(members, 2) // 阈值 = 2
+      .accounts({
+        multisig: multisigPDA,
+        creator: member1.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([member1])
+      .rpc();
+
+    await provider.sendAndConfirm(
+    (() => {
+      const tx = new anchor.web3.Transaction();
+      tx.add(
+        SystemProgram.transfer({
+          fromPubkey: member1.publicKey,
+          toPubkey: multisigPDA,
+          lamports: 0.1 * LAMPORTS_PER_SOL,
+        })
+      );
+      return tx;
+      })(),
+      [member1]
+    );  
+
+    const multisigAccount = await program.account.multisig.fetch(multisigPDA);
+    assert.equal(multisigAccount.members.length, 3);
+    assert.equal(multisigAccount.threshold, 2);
+    assert.equal(multisigAccount.nonce, 0n);
+  });
+
+  it("Proposes a SOL transfer transaction", async () => {
+    const transferAmount = 0.01 * LAMPORTS_PER_SOL;
+
+    // 构建 SystemProgram 转账指令
+    const transferIx = SystemProgram.transfer({
+      fromPubkey: multisigPDA, // 多签 PDA 作为发送方
+      toPubkey: recipient.publicKey,
+      lamports: BigInt(transferAmount),
+    });
+
+    // 提议交易
+    const [proposalPDA, proposalBump] = PublicKey.findProgramAddressSync(
+      [Buffer.from("proposal"), multisigPDA.toBuffer(), new anchor.BN(0).toBuffer("le", 8)],
+      program.programId
+    );
+
+    await program.methods
+      .proposeTransaction({
+        programId: transferIx.programId,
+        accounts: transferIx.keys,
+        data: transferIx.data!,
+      })
+      .accounts({
+        multisig: multisigPDA,
+        proposal: proposalPDA,
+        proposer: member1.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([member1])
+      .rpc();
+
+    const proposal = await program.account.proposal.fetch(proposalPDA);
+    assert.equal(proposal.proposer.toBase58(), member1.publicKey.toBase58());
+    assert.equal(proposal.approvals.length, 0);
+    assert.isFalse(proposal.executed);
+  });
+
+  it("Approves the transaction (2 members)", async () => {
+    const proposalPDA = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("proposal"), multisigPDA.toBuffer(), new anchor.BN(0).toBuffer("le", 8)],
+        program.programId
+      )
+    )[0];
+
+    // 成员1 批准（虽然是提议者，也可以批准）
+    await program.methods
+      .approveTransaction()
+      .accounts({
+        multisig: multisigPDA,
+        proposal: proposalPDA,
+        approver: member1.publicKey,
+      })
+      .signers([member1])
+      .rpc();
+
+    // 成员2 批准
+    await program.methods
+      .approveTransaction()
+      .accounts({
+        multisig: multisigPDA,
+        proposal: proposalPDA,
+        approver: member2.publicKey,
+      })
+      .signers([member2])
+      .rpc();
+
+    const proposal = await program.account.proposal.fetch(proposalPDA);
+    assert.equal(proposal.approvals.length, 2);
+  });
+
+  it("Executes the transaction", async () => {
+    const proposalPDA = (
+      await PublicKey.findProgramAddress(
+        [Buffer.from("proposal"), multisigPDA.toBuffer(), new anchor.BN(0).toBuffer("le", 8)],
+        program.programId
+      )
+    )[0];
+
+    // 获取转账前余额
+    const balanceBefore = await provider.connection.getBalance(recipient.publicKey);
+
+    // 执行交易（需传入 remainingAccounts）
+    const transferIx = SystemProgram.transfer({
+      fromPubkey: multisigPDA,
+      toPubkey: recipient.publicKey,
+      lamports: BigInt(0.01 * LAMPORTS_PER_SOL),
+    });
+
+    await program.methods
+      .executeTransaction()
+      .accounts({
+        multisig: multisigPDA,
+        proposal: proposalPDA,
+      })
+      .remainingAccounts(
+        transferIx.keys.map(key => ({
+          pubkey: key.pubkey,
+          isSigner: key.isSigner,
+          isWritable: key.isWritable,
+        }))
+      )
+      .rpc();
+
+    // 检查余额增加
+    const balanceAfter = await provider.connection.getBalance(recipient.publicKey);
+    assert.equal(balanceAfter - balanceBefore, 0.01 * LAMPORTS_PER_SOL);
+
+    // 检查 Proposal 已关闭（应抛错）
+    try {
+      await program.account.proposal.fetch(proposalPDA);
+      assert.fail("Proposal should be closed");
+    } catch (e) {
+      assert.include(e.message, "Account does not exist");
+    }
+  });
+});
+
+*/
+
+import * as anchor from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import { Multisig } from "../target/types/multisig";
+import {
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  TransactionInstruction,
+  AccountMeta,
+} from "@solana/web3.js";
+import { BN } from "bn.js";
+
+describe("multisig", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const program = anchor.workspace.Multisig as Program<Multisig>;
+
+  // 成员密钥对（模拟 3 个用户）
+  const member1 = Keypair.generate();
+  const member2 = Keypair.generate();
+  const member3 = Keypair.generate();
+  const members = [member1, member2, member3];
+  const memberPubkeys = members.map((m) => m.publicKey);
+
+  // 接收转账的地址
+  const receiver = Keypair.generate();
+
+  let multisigPda: PublicKey;
+  let multisigBump: number;
+  let nonce = 0; // 客户端管理 nonce
+
+  before(async () => {
+    // 给所有成员和接收者空投 SOL
+    for (const member of members) {
+      await provider.connection.confirmTransaction(
+        await provider.connection.requestAirdrop(member.publicKey, 2 * anchor.web3.LAMPORTS_PER_SOL),
+        "confirmed"
+      );
+    }
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(receiver.publicKey, 1 * anchor.web3.LAMPORTS_PER_SOL),
+      "confirmed"
+    );
+
+    // 导出 PDA
+    [multisigPda, multisigBump] = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("multisig"),
+        member1.publicKey.toBuffer(), // creator = member1
+        Buffer.from([nonce]),
+      ],
+      program.programId
+    );
+    console.log("Multisig Pda:", multisigPda.toString());
+  });
+
+  it("Creates a multisig", async () => {
+    const tx = await program.methods
+      .createMultisig(nonce, memberPubkeys, 2) // 阈值=2
+      .accounts({
+        multisig: multisigPda,
+        creator: member1.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([member1])
+      .rpc();
+
+    console.log("✅ Multisig created:", tx);
+
+    await provider.sendAndConfirm(
+    (() => {
+      const tx = new anchor.web3.Transaction();
+      tx.add(
+        SystemProgram.transfer({
+          fromPubkey: member1.publicKey,
+          toPubkey: multisigPda,
+          lamports: 0.1 * anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      return tx;
+      })(),
+      [member1]
+    );      
+
+    const multisigAccount = await program.account.multisig.fetch(multisigPda);
+    console.log("Members:", multisigAccount.members.map((k: PublicKey) => k.toString()));
+    console.log("Threshold:", multisigAccount.threshold);
+    console.log("Proposals count:", multisigAccount.proposalsCount);
+    console.log("Bump:", multisigAccount.bump);
+  });
+
+  let proposalPda: PublicKey;
+  let proposalBump: number;
+
+  it("Proposes a transaction (transfer 0.1 SOL)", async () => {
+    // 构造 CPI 指令：SystemProgram.transfer
+    const transferIx = SystemProgram.transfer({
+      fromPubkey: multisigPda,
+      toPubkey: receiver.publicKey,
+      lamports: 0.1 * anchor.web3.LAMPORTS_PER_SOL,
+    });
+
+    const accountsWithProgram = [
+      ...transferIx.keys,
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ];
+
+    // 序列化为 InstructionData
+    const instructionData = {
+      programId: transferIx.programId, // 实际是 SystemProgram
+      accounts: accountsWithProgram.map(k => ({
+        pubkey: k.pubkey,
+        isSigner: k.isSigner,
+        isWritable: k.isWritable,
+      })),
+      data: transferIx.data,
+    };
+
+    // 计算 Proposal PDA（注意：proposals_count 初始为 0）
+    [proposalPda, proposalBump] = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("proposal"),
+        multisigPda.toBuffer(),
+        new anchor.BN(0).toBuffer("le", 4), // proposals_count = 0
+      ],
+      program.programId
+    );
+
+    const tx = await program.methods
+      .proposeTransaction(instructionData)
+      .accounts({
+        multisig: multisigPda,
+        proposal: proposalPda,
+        proposer: member1.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([member1])
+      .rpc();
+
+    console.log("✅ Proposal created:", tx);
+
+    const proposal = await program.account.proposal.fetch(proposalPda);
+    console.log("Proposal proposer:", proposal.proposer.toString());
+    console.log("Approvals:", proposal.approvals.length);
+  });
+
+  it("Approves the proposal by member2", async () => {
+    const tx = await program.methods
+      .approveTransaction()
+      .accounts({
+        multisig: multisigPda,
+        proposal: proposalPda,
+        approver: member2.publicKey,
+      })
+      .signers([member2])
+      .rpc();
+
+    console.log("✅ Approved by member2:", tx);
+
+    const proposal = await program.account.proposal.fetch(proposalPda);
+    console.log("Total approvals:", proposal.approvals.length);
+  });
+
+  it("Approves the proposal by member3", async () => {
+    const tx = await program.methods
+      .approveTransaction()
+      .accounts({
+        multisig: multisigPda,
+        proposal: proposalPda,
+        approver: member3.publicKey,
+      })
+      .signers([member3])
+      .rpc();
+
+    console.log("✅ Approved by member3:", tx);
+
+    const proposal = await program.account.proposal.fetch(proposalPda);
+    console.log("Total approvals:", proposal.approvals.length);
+  });
+
+  it("Executes the proposal", async () => {
+    // 获取当前余额
+    const balanceBefore = await provider.connection.getBalance(receiver.publicKey);
+
+    // 执行提案（需要提供 remainingAccounts）
+    const proposalAccount = await program.account.proposal.fetch(proposalPda);
+    const multisigAccount = await program.account.multisig.fetch(multisigPda);
+
+    // 构造 remainingAccounts（必须与 proposal.instruction.accounts 顺序一致）
+    const remainingAccounts: AccountMeta[] = proposalAccount.instruction.accounts.map(
+      (acc: any) => {
+        const pubkey = new PublicKey(acc.pubkey);
+        return {
+          pubkey,
+          isSigner: pubkey.equals(multisigPda) ? false : acc.isSigner, // 关键！
+          isWritable: acc.isWritable,
+        };
+      }
+    );
+
+    const tx = await program.methods
+      .executeTransaction()
+      .accounts({
+        multisig: multisigPda,
+        proposal: proposalPda,
+      })
+      .remainingAccounts(remainingAccounts)
+      .rpc();
+
+    console.log("✅ Proposal executed:", tx);
+
+    const balanceAfter = await provider.connection.getBalance(receiver.publicKey);
+    console.log("Receiver balance increased by:", balanceAfter - balanceBefore);
+    // 应该 ≈ 0.1 SOL
+  });
+
+  // 可选：测试取消提案（需新建一个提案）
+  it("Creates and cancels a proposal", async () => {
+    // 新建一个提案（proposals_count 现在是 1）
+    const dummyIx = SystemProgram.transfer({
+      fromPubkey: multisigPda,
+      toPubkey: receiver.publicKey,
+      lamports: 1000,
+    });
+
+    const instructionData = {
+      programId: dummyIx.programId,
+      accounts: dummyIx.keys.map((k) => ({
+        pubkey: k.pubkey,
+        isSigner: k.isSigner,
+        isWritable: k.isWritable,
+      })),
+      data: dummyIx.data,
+    };
+
+    const [newProposalPda] = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("proposal"),
+        multisigPda.toBuffer(),
+        new anchor.BN(1).toBuffer("le", 4), // proposals_count = 1
+      ],
+      program.programId
+    );
+
+    // 提案
+    await program.methods
+      .proposeTransaction(instructionData)
+      .accounts({
+        multisig: multisigPda,
+        proposal: newProposalPda,
+        proposer: member1.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([member1])
+      .rpc();
+
+    // 取消（必须由 proposer = member1）
+    const cancelTx = await program.methods
+      .cancelTransaction()
+      .accounts({
+        multisig: multisigPda,
+        proposal: newProposalPda,
+        canceller: member1.publicKey,
+      })
+      .signers([member1])
+      .rpc();
+
+    console.log("✅ Proposal cancelled:", cancelTx);
+
+    // 验证提案已被关闭（fetch 应抛错）
+    try {
+      await program.account.proposal.fetch(newProposalPda);
+      throw new Error("Proposal should be closed");
+    } catch (e) {
+      console.log("✅ Proposal account closed after cancellation");
+    }
+  });
+});
